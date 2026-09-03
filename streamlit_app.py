@@ -473,12 +473,14 @@ def _build_run_from_final_group(gid, zdf):
 
 
 
-def _limit_final_ml_runs(ml_df, max_runs=96, per_bucket=4):
-    """최종 ML CSV는 유지하되, Streamlit 화면으로 넘길 run 수만 제한합니다.
+def _limit_final_ml_runs(ml_df, max_runs=96, per_bucket=2):
+    """CSV 원본은 그대로 두고, 브라우저(HTML/JS)로 넘기는 run만 제한합니다.
 
-    50,000행 전체를 JS JSON으로 넣으면 HTML이 너무 커져 배포 환경에서 앱이 멈출 수 있습니다.
-    소형/중형/대형, 건식/물걸레, 충전 필요 여부가 골고루 남도록 global_run_id 단위로 샘플링합니다.
-    한 run의 zone들은 모두 같이 유지되므로 집 전체 SOC 합산 로직은 깨지지 않습니다.
+    중요:
+    - global_run_id 단위로 선택하므로 한 run의 모든 zone은 함께 유지됩니다.
+    - area_pyung까지 버킷에 포함해 각 평수 데이터가 샘플링 과정에서 사라지지 않게 합니다.
+    - Streamlit/Pandas는 전체 CSV를 읽을 수 있지만, 전체 run을 JSON으로 HTML에 삽입하면
+      components.html() 문서가 지나치게 커질 수 있으므로 이 단계에서만 줄입니다.
     """
     if ml_df is None or len(ml_df) == 0 or "global_run_id" not in ml_df.columns:
         return ml_df
@@ -501,9 +503,17 @@ def _limit_final_ml_runs(ml_df, max_runs=96, per_bucket=4):
     run_meta = df.groupby("global_run_id", sort=False).agg(agg)
 
     def _bucket_row(row):
-        zone_count = int(row.get("zone_count", 0) or 0)
+        try:
+            area = int(round(float(row.get("area_pyung", 0) or 0)))
+        except Exception:
+            area = 0
+
+        try:
+            zone_count = int(round(float(row.get("zone_count", 0) or 0)))
+        except Exception:
+            zone_count = 0
+
         if zone_count not in [4, 6, 8]:
-            area = float(row.get("area_pyung", 0) or 0)
             zone_count = 4 if area <= 24 else (6 if area <= 49 else 8)
 
         mop = 0
@@ -516,8 +526,13 @@ def _limit_final_ml_runs(ml_df, max_runs=96, per_bucket=4):
             txt = str(row.get("cleaning_type", "")).lower()
             mop = 1 if any(k in txt for k in ["물", "걸레", "mop", "wet"]) else 0
 
-        charge_flag = 1 if float(row.get("charge_count", 0) or 0) > 0 else 0
-        return f"{zone_count}_{mop}_{charge_flag}"
+        try:
+            charge_flag = 1 if float(row.get("charge_count", 0) or 0) > 0 else 0
+        except Exception:
+            charge_flag = 0
+
+        # 평수까지 포함해야 findRun(areaPyung, mopEnabled)가 필요한 평수를 찾을 수 있습니다.
+        return f"{area}_{zone_count}_{mop}_{charge_flag}"
 
     run_meta["_bucket"] = run_meta.apply(_bucket_row, axis=1)
 
@@ -530,30 +545,21 @@ def _limit_final_ml_runs(ml_df, max_runs=96, per_bucket=4):
 
         if len(part) <= per_bucket:
             chosen = part.index.tolist()
+        elif per_bucket <= 1:
+            chosen = [part.index[len(part) // 2]]
         else:
             positions = [round(i * (len(part) - 1) / (per_bucket - 1)) for i in range(per_bucket)]
             chosen = part.iloc[positions].index.tolist()
+
         selected_ids.extend(chosen)
 
     selected_ids = list(dict.fromkeys(map(str, selected_ids)))
+
+    # 버킷이 매우 많아도 HTML로 넘기는 run 수는 상한을 둡니다.
     if len(selected_ids) > max_runs:
         selected_ids = selected_ids[:max_runs]
 
-    limited = df[df["global_run_id"].isin(selected_ids)].copy()
-
-    if "zone_count" in df.columns:
-        present = set(limited["zone_count"].dropna().astype(int).unique().tolist())
-        source_counts = set(df["zone_count"].dropna().astype(int).unique().tolist())
-        needed = [z for z in [4, 6, 8] if z not in present and z in source_counts]
-        if needed:
-            extra_ids = []
-            for zc in needed:
-                candidates = df[df["zone_count"].astype(int) == zc]["global_run_id"].drop_duplicates().astype(str).tolist()
-                if candidates:
-                    extra_ids.append(candidates[0])
-            limited = df[df["global_run_id"].isin(selected_ids + extra_ids)].copy()
-
-    return limited
+    return df[df["global_run_id"].isin(selected_ids)].copy()
 
 
 def make_prediction_payload_from_final_ml(ml_df):
@@ -763,7 +769,10 @@ ml_output_path = _first_existing_csv([ML_OUTPUT_PATH, ML_OUTPUT_ALT_PATH])
 ml_output_df = load_prediction_csv(str(ml_output_path)) if ml_output_path else None
 
 if ml_output_df is not None:
-    ui_prediction_data = make_prediction_payload_from_final_ml(ml_output_df)
+    # CSV 전체는 Pandas가 읽되, components.html() 안으로는 대표 run만 전달합니다.
+    # 3~5만 행 자체보다 전체 데이터를 JSON으로 브라우저에 삽입하는 것이 훨씬 큰 병목입니다.
+    ml_output_ui_df = _limit_final_ml_runs(ml_output_df, max_runs=96, per_bucket=2)
+    ui_prediction_data = make_prediction_payload_from_final_ml(ml_output_ui_df)
 else:
     home_pred_df = load_prediction_csv(str(HOME_PRED_PATH))
     zone_pred_df = load_prediction_csv(str(ZONE_PRED_PATH))
